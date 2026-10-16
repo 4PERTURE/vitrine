@@ -1,9 +1,9 @@
 // Player redesign: Animated artwork, the track's Canvas or Apple Music's animated cover behind the player,
 // the way the Music app draws it. The clip runs edge to edge from the top, sharp to near its foot, where
-// it dissolves into its own last rows drawn on down to the bottom of the field, so it ends in its own
-// color rather than on the Fluid field. A blur comes in from the seam (from above the controls for a
-// Canvas as tall as the screen) and lies under the controls; a cover moved down fades in from its own top color;
-// behind the lyrics the whole clip is blurred.
+// it dissolves into a copy of itself mirrored across the seam, which goes on down to the bottom of the field,
+// so it ends in its own picture rather than on the Fluid field. A blur comes in from the seam (from above the
+// controls for a Canvas as tall as the screen) and lies under the controls; a cover moved down has a mirrored,
+// blurred copy above it too, the way the lock screen draws it; behind the lyrics the whole clip is blurred.
 // The player's square cover goes while a clip plays, so a track without one keeps its cover over Fluid
 // (PlayerField.x keeps the field Fluid for this choice). The player's ⋯ menu switches between Animated
 // and Fluid at once (Shared/Player/SpeedPitch.h).
@@ -45,37 +45,32 @@
 
 // Where the clip starts dissolving into its foot, as a share of its height.
 static const CGFloat kFootFrom = 0.9;
-// The share of the poster's height, at its bottom, drawn on down as the foot (one pixel row at least).
-static const CGFloat kFootRows = 0.01;
 // A clip this much taller than wide is a Canvas (9:16), drawn to the window's full height and centered, cut at its
 // sides. Anything less tall, such as Apple Music's 3:4 cover, keeps its own shape: whole, and moved down a little.
 static const CGFloat kCanvasAspect = 1.5;
 // A clip that does not fill the window is moved down by this share of the window's height, clear of the header.
-// The room it leaves above is drawn in the cover's own top color, which the cover fades in from.
+// The room it leaves above is a mirrored, blurred copy of the cover, which the cover fades in from.
 static const CGFloat kCoverDrop = 0.07;
 // The blur starts at the seam, or this share of the screen down where that is higher, so it is under the
 // controls whatever the clip's shape; it is whole kBlurRamp points below its start.
 static const CGFloat kBlurByControls = 0.6, kBlurRamp = 96;
-// A cover that ends above that starts its blur this far before its seam, so the foot's stretched rows are
-// already soft where they begin. At the top the cover fades in over kHeadRamp points, so its top edge is not seen.
+// A cover that ends above that starts its blur this far before its seam, so it is already soft where its mirror
+// begins. At the top the cover fades in over kHeadRamp points, and the blur there fades out over twice that.
 static const CGFloat kBlurLead = 110, kHeadRamp = 48;
-// The head and the foot are the clip's first and last rows averaged down to this many columns: smooth, and the color
-// the clip starts and ends in. They are read again from the clip's frame this many times a second while it plays, so
-// a cover that zooms in and out keeps them in step.
-static const size_t kEdgeColumns = 24;
-static const NSTimeInterval kEdgeEvery = 1.0 / 30;
+// How much of the blur's material shows, at the top and the bottom, at most: less of it is less gray over the picture.
+static const CGFloat kSeamBlurMost = 0.9;
 // Seconds a clip may be on screen in front without drawing a frame before it is given up.
 static const NSTimeInterval kGiveUp = 5;
 // Seconds the last track's clip stays on a skip for the next one's to come in over it.
 static const NSTimeInterval kHandOver = 0.4;
 // The dim's floor and ceiling, and what the lyrics add to it.
-static const CGFloat kDimLeast = 0.10, kDimMost = 0.80, kDimLyrics = 0.15;
+static const CGFloat kDimLeast = 0.04, kDimMost = 0.80, kDimLyrics = 0.15;
 // The frames measured for the dim besides the poster, in seconds into the clip (one past its end is skipped).
 static const double kMeasuredAt[] = {1, 2};
 
 CGFloat SGRPlayerClipDim(CGFloat luminance, BOOL contrast, BOOL lyrics) {
     // White is 1, so (1 + 0.05) / (L + 0.05) >= ratio puts the clip's luminance at `most` or under.
-    CGFloat ratio = contrast ? 7 : 4.5, most = 1.05 / ratio - 0.05;
+    CGFloat ratio = contrast ? 7 : 3, most = 1.05 / ratio - 0.05;
     // A black layer scales the clip's encoded values, which Core Animation blends, so its linear luminance
     // goes down by about the 2.2nd power of what the layer leaves.
     CGFloat dim = luminance > most ? 1 - pow(most / luminance, 1 / 2.2) : 0;
@@ -133,16 +128,15 @@ static CGFloat brightEnd(NSData *luminances) {
     UIView *_picture;   // the clip over its foot, faded in as one
     CALayer *_still;    // the poster, with the video drawn over it
     AVPlayerLayer *_clip;
-    CAGradientLayer *_clipMask, *_seamMask;
+    CAGradientLayer *_clipMask, *_seamMask, *_headMask;
+    // The clip flipped across its seam (the foot) and across where its fade-in ends (the head): what is drawn below
+    // and above it, as the lock screen draws the cover. Each is a still with a video over it, like _still.
     CALayer *_foot, *_head;
-    CGFloat _footRows;   // the share of the poster's height the foot draws, from its bottom
+    AVPlayerLayer *_footClip, *_headClip;
     CALayer *_dim;   // black over the clip and its foot, as dark as the clip is bright
-    AVPlayerItemVideoOutput *_output;   // the clip's frames, read for the head's and the foot's color
-    AVPlayerItem *_outputItem;   // the item _output is on; the looper swaps items as the clip loops
-    NSTimer *_edgeTimer;
     NSMutableData *_luminances;   // of the frames measured so far
     BOOL _lyricsUp;
-    UIVisualEffectView *_seamBlur, *_lyricsBlur;
+    UIVisualEffectView *_seamBlur, *_headBlur, *_lyricsBlur;
     CGFloat _aspect;
     BOOL _timing;   // the give-up's count is running
 }
@@ -153,29 +147,6 @@ static UIBlurEffect *blurEffect(void) {
     return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
 }
 
-// The first rows (`share` of the height), or the last, of an image, averaged down to kEdgeColumns columns and one
-// row. Drawn stretched over the head's or the foot's room it is the color the clip begins or ends in, without the
-// streaks of stretching the rows themselves. The caller releases it.
-static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom) {
-    size_t width = CGImageGetWidth(source), height = CGImageGetHeight(source);
-    if (!width || !height) return NULL;
-    size_t rows = MIN(height, MAX((size_t)1, (size_t)round(height * share)));
-    CGImageRef strip = CGImageCreateWithImageInRect(source, CGRectMake(0, bottom ? height - rows : 0, width, rows));
-    if (!strip) return NULL;
-    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef context = CGBitmapContextCreate(NULL, kEdgeColumns, 1, 8, 0, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
-    CGColorSpaceRelease(space);
-    CGImageRef image = NULL;
-    if (context) {
-        CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
-        CGContextDrawImage(context, CGRectMake(0, 0, kEdgeColumns, 1), strip);
-        image = CGBitmapContextCreateImage(context);
-        CGContextRelease(context);
-    }
-    CGImageRelease(strip);
-    return image;
-}
-
 - (instancetype)initWithFrame:(CGRect)frame {
     if (!(self = [super initWithFrame:frame])) return nil;
     self.userInteractionEnabled = NO;
@@ -183,10 +154,18 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
     _picture = [[UIView alloc] initWithFrame:frame];
     [self addSubview:_picture];
     _foot = [CALayer layer];
-    _foot.contentsGravity = kCAGravityResize;
+    _foot.contentsGravity = kCAGravityResizeAspectFill;
+    _foot.masksToBounds = YES;
+    _footClip = [AVPlayerLayer layer];
+    _footClip.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    [_foot addSublayer:_footClip];
     [_picture.layer addSublayer:_foot];
     _head = [CALayer layer];
-    _head.contentsGravity = kCAGravityResize;
+    _head.contentsGravity = kCAGravityResizeAspectFill;
+    _head.masksToBounds = YES;
+    _headClip = [AVPlayerLayer layer];
+    _headClip.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    [_head addSublayer:_headClip];
     [_picture.layer addSublayer:_head];
     // An AVPlayerLayer draws nothing until its first frame is decoded, so the poster, the clip's first
     // frame and where the looper starts, is the contents of the layer the video draws in: there is a
@@ -211,10 +190,20 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
     _seamBlur.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     UIView *mask = [UIView new];
     _seamMask = [CAGradientLayer layer];
-    _seamMask.colors = @[(id)UIColor.clearColor.CGColor, (id)UIColor.blackColor.CGColor];
+    _seamMask.colors = @[(id)UIColor.clearColor.CGColor, (id)[UIColor.blackColor colorWithAlphaComponent:kSeamBlurMost].CGColor];
     [mask.layer addSublayer:_seamMask];
     _seamBlur.maskView = mask;
     [self addSubview:_seamBlur];
+    // The same from the top: whole over the head, fading out below the cover's top edge.
+    _headBlur = [[UIVisualEffectView alloc] initWithEffect:nil];
+    _headBlur.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    UIView *headMask = [UIView new];
+    _headMask = [CAGradientLayer layer];
+    UIColor *headMost = [UIColor.blackColor colorWithAlphaComponent:kSeamBlurMost];
+    _headMask.colors = @[(id)headMost.CGColor, (id)headMost.CGColor, (id)UIColor.clearColor.CGColor];
+    [headMask.layer addSublayer:_headMask];
+    _headBlur.maskView = headMask;
+    [self addSubview:_headBlur];
     _lyricsBlur = [[UIVisualEffectView alloc] initWithEffect:nil];
     _lyricsBlur.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     [self addSubview:_lyricsBlur];
@@ -236,7 +225,6 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
 
 - (void)dealloc {
     [NSNotificationCenter.defaultCenter removeObserver:self];
-    [_edgeTimer invalidate];
 }
 
 - (void)setScreenHeight:(CGFloat)height {
@@ -259,6 +247,9 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
     _picture.frame = bounds;
     _seamBlur.frame = bounds;
     _seamBlur.maskView.frame = bounds;
+    _headBlur.frame = bounds;
+    _headBlur.maskView.frame = bounds;
+    _headBlur.hidden = top <= 0;   // a clip that fills the window has no room above it
     _lyricsBlur.frame = bounds;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -267,94 +258,45 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
     _clipMask.frame = _still.bounds;
     // A clip that was moved down fades in from the head over its first points; one that fills the window does not.
     _clipMask.locations = @[@0, @(top > 0 && height > 0 ? MIN(kFootFrom, kHeadRamp / height) : 0), @(kFootFrom), @1];
-    _foot.frame = CGRectMake(0, seam, width, MAX(0, total - seam));
-    // The foot takes the same middle the clip shows when it is drawn taller than its shape and cut at its sides.
-    CGFloat shown = fills && height > 0 ? MIN(1, width * _aspect / height) : 1;
-    _foot.contentsRect = CGRectMake((1 - shown) / 2, 0, shown, 1);
-    // The head runs from the top of the window to under the clip's fade-in, so what shows through is its color.
-    _head.frame = CGRectMake(0, 0, width, top > 0 ? top + kHeadRamp : 0);
+    // The foot is the clip flipped about its seam: below the seam it shows the rows above it, nearest first. The
+    // head is the clip flipped about where its fade-in ends, so what shows through the fade-in, and above the
+    // clip, is the picture too. Each is drawn as the clip is (same size and fill), so they stay in step with it.
+    CGRect size = CGRectMake(0, 0, width, height);
+    CGFloat seamRow = round(height * kFootFrom);
+    _foot.bounds = size;
+    _foot.position = CGPointMake(width / 2, top + 2 * seamRow - height / 2);
+    _foot.transform = CATransform3DMakeScale(1, -1, 1);
+    _footClip.frame = size;
+    _head.bounds = size;
+    _head.position = CGPointMake(width / 2, top + 2 * kHeadRamp - height / 2);
+    _head.transform = CATransform3DMakeScale(1, -1, 1);
+    _headClip.frame = size;
+    _head.hidden = top <= 0;
     _dim.frame = bounds;
     _seamMask.frame = bounds;
+    _headMask.frame = bounds;
+    _headMask.locations = @[@0, @(MIN(1, top / total)), @(MIN(1, (top + 2 * kHeadRamp) / total))];
     _seamMask.locations = @[@(MIN(1, blurFrom / total)), @(MIN(1, (blurFrom + kBlurRamp) / total))];
     [CATransaction commit];
 }
 
 - (void)playFile:(NSURL *)file poster:(UIImage *)poster {
     _aspect = poster.size.height / poster.size.width;
-    // The poster's last rows, stretched from the seam to the bottom: the clip goes on down in its own color.
-    _footRows = MAX(kFootRows, 1 / MAX(1, poster.size.height * poster.scale));
-    // The head and the foot begin as the poster's first and last rows; while the clip plays they follow its frames.
-    CGImageRef head = createEdgeImage(poster.CGImage, _footRows, NO), foot = createEdgeImage(poster.CGImage, _footRows, YES);
-    [self setHead:head foot:foot];
-    if (head) CGImageRelease(head);
-    if (foot) CGImageRelease(foot);
+    // The foot and the head have the poster under their video too, as _still has, until the video draws a frame.
     _still.contents = (__bridge id)poster.CGImage;
+    _foot.contents = (__bridge id)poster.CGImage;
+    _head.contents = (__bridge id)poster.CGImage;
     [self setNeedsLayout];
     _player = [AVQueuePlayer new];
     _player.muted = YES;
     _player.preventsDisplaySleepDuringVideoPlayback = NO;
     _looper = [AVPlayerLooper playerLooperWithPlayer:_player templateItem:[AVPlayerItem playerItemWithURL:file]];
     _clip.player = _player;
-    [_outputItem removeOutput:_output];
-    _outputItem = nil;
-    _output = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:@{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)}];
-    if (!_edgeTimer) {
-        __weak SGRPlayerMotionView *weakSelf = self;
-        _edgeTimer = [NSTimer timerWithTimeInterval:kEdgeEvery repeats:YES block:^(NSTimer *timer) {
-            SGRPlayerMotionView *view = weakSelf;
-            if (view) [view sampleEdges];
-            else [timer invalidate];
-        }];
-        [NSRunLoop.mainRunLoop addTimer:_edgeTimer forMode:NSRunLoopCommonModes];
-    }
+    _footClip.player = _player;
+    _headClip.player = _player;
     [self setNeedsLayout];
     [self updateMotion];
     [self measure:file poster:poster];
-}
-
-// No implicit fade: the contents change on every frame.
-- (void)setHead:(CGImageRef)head foot:(CGImageRef)foot {
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    if (head) _head.contents = (__bridge id)head;
-    if (foot) _foot.contents = (__bridge id)foot;
-    [CATransaction commit];
-}
-
-// Reads the frame the clip is on: its top and bottom rows become the head and the foot.
-- (void)sampleEdges {
-    AVPlayerItem *item = _player.currentItem;
-    if (!_output || !item) return;
-    if (item != _outputItem) {
-        [_outputItem removeOutput:_output];
-        [item addOutput:_output];
-        _outputItem = item;
-    }
-    CMTime time = [_output itemTimeForHostTime:CACurrentMediaTime()];
-    if (![_output hasNewPixelBufferForItemTime:time]) return;
-    CVPixelBufferRef buffer = [_output copyPixelBufferForItemTime:time itemTimeForDisplay:NULL];
-    if (!buffer) return;
-    size_t width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer);
-    // A frame that is not the poster's shape (turned by the track's transform, say) is not read.
-    if (width && height && fabs((CGFloat)height / width - _aspect) <= 0.05 * _aspect) {
-        CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
-        size_t stride = CVPixelBufferGetBytesPerRow(buffer);
-        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, CVPixelBufferGetBaseAddress(buffer), stride * height, NULL);
-        CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-        CGImageRef frame = CGImageCreate(width, height, 8, 32, stride, space,
-                                         (CGBitmapInfo)(kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst), provider, NULL, false, kCGRenderingIntentDefault);
-        CGColorSpaceRelease(space);
-        CGDataProviderRelease(provider);
-        if (frame) {
-            CGImageRef head = createEdgeImage(frame, _footRows, NO), foot = createEdgeImage(frame, _footRows, YES);
-            CGImageRelease(frame);
-            [self setHead:head foot:foot];
-            if (head) CGImageRelease(head);
-            if (foot) CGImageRelease(foot);
-        }
-        CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
-    }
-    CVPixelBufferRelease(buffer);
 }
 
 // The poster now, so the clip comes in already dimmed, and two later frames as they are read.
@@ -397,6 +339,7 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
     void (^apply)(void) = ^{
         self->_picture.alpha = 1;
         self->_seamBlur.effect = blurEffect();
+        self->_headBlur.effect = blurEffect();
     };
     if (animated) {
         SGRAnimate(SGRMotionFade, apply, ^(BOOL finished) {
@@ -413,6 +356,7 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
     SGRAnimate(SGRMotionFade, ^{
         self->_picture.alpha = 0;
         self->_seamBlur.effect = nil;
+        self->_headBlur.effect = nil;
         self->_lyricsBlur.effect = nil;
     }, ^(BOOL finished) { done(); });
 }
@@ -442,7 +386,6 @@ static CGImageRef createEdgeImage(CGImageRef source, CGFloat share, BOOL bottom)
         && !SGPlayerState().isPaused;
     if (may) [_player play];
     else [_player pause];
-    _edgeTimer.fireDate = may ? NSDate.date : NSDate.distantFuture;
     // A paused player still draws the clip's first frame, so the count runs whenever it is on screen in front.
     if (_player && self.window && front && !_timing && !_clip.readyForDisplay) {
         _timing = YES;
