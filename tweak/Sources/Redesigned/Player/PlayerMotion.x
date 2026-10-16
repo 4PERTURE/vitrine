@@ -47,7 +47,13 @@
 static const CGFloat kFootFrom = 0.9;
 // A clip this much taller than wide is a Canvas (9:16), drawn to the window's full height and centered, cut at its
 // sides. Anything less tall, such as Apple Music's 3:4 cover, keeps its own shape: whole, and moved down a little.
+// This is also how the two sources are told apart (the follower hands the player the clip's file and not its source,
+// SGMotionFollower.m), and what is new for the cover is for the cover alone: the mirrored head and foot, the earlier
+// blur, and no dim (but the lyrics'). A Canvas keeps what it had: its own last rows stretched down as its foot, the
+// blur from the seam with the material whole, and the dim that holds white text to 4.5:1.
 static const CGFloat kCanvasAspect = 1.5;
+// The share of the poster's height, at its bottom, that a Canvas's foot draws on down (one pixel row at least).
+static const CGFloat kFootRows = 0.01;
 // A clip that does not fill the window is moved down by this share of the window's height, clear of the header.
 // The room it leaves above is a mirrored, blurred copy of the cover, which the cover fades in from.
 static const CGFloat kCoverDrop = 0.07;
@@ -61,23 +67,18 @@ static const CGFloat kBlurLead = 110, kHeadRamp = 48;
 static const CGFloat kMirrorBlur = 50;
 // How much of the blur's material shows, at the top and the bottom, at most: less of it is less gray over the picture.
 static const CGFloat kSeamBlurMost = 0.75;
-// The top and the bottom of the window are tinted toward the colors of the cover's own top and bottom rows (the
-// share of its height in kEdgeRows), darkened by kEdgeShade, and by kEdgeTint at the very top and from kFootTintReach
-// points below the seam: the lock screen's top and bottom are the cover's own, dark. Without it a bright part of a
-// dark cover (a white dress on black) glows, mirrored, and the blur's material has a light tint of its own.
-static const CGFloat kEdgeRows = 0.08, kEdgeShade = 0.75, kEdgeTint = 0.88, kFootTintReach = 130;
 // Seconds a clip may be on screen in front without drawing a frame before it is given up.
 static const NSTimeInterval kGiveUp = 5;
 // Seconds the last track's clip stays on a skip for the next one's to come in over it.
 static const NSTimeInterval kHandOver = 0.4;
 // The dim's floor and ceiling, and what the lyrics add to it.
-static const CGFloat kDimLeast = 0.04, kDimMost = 0.80, kDimLyrics = 0.15;
+static const CGFloat kDimLeast = 0.10, kDimMost = 0.80, kDimLyrics = 0.15;
 // The frames measured for the dim besides the poster, in seconds into the clip (one past its end is skipped).
 static const double kMeasuredAt[] = {1, 2};
 
 CGFloat SGRPlayerClipDim(CGFloat luminance, BOOL contrast, BOOL lyrics) {
     // White is 1, so (1 + 0.05) / (L + 0.05) >= ratio puts the clip's luminance at `most` or under.
-    CGFloat ratio = contrast ? 7 : 3, most = 1.05 / ratio - 0.05;
+    CGFloat ratio = contrast ? 7 : 4.5, most = 1.05 / ratio - 0.05;
     // A black layer scales the clip's encoded values, which Core Animation blends, so its linear luminance
     // goes down by about the 2.2nd power of what the layer leaves.
     CGFloat dim = luminance > most ? 1 - pow(most / luminance, 1 / 2.2) : 0;
@@ -105,27 +106,6 @@ static void addLuminances(CGImageRef image, NSMutableData *into) {
         float luminance = 0.2126f * linear[0] + 0.7152f * linear[1] + 0.0722f * linear[2];
         [into appendBytes:&luminance length:sizeof luminance];
     }
-}
-
-// The average color of an image's first rows, or its last (`share` of its height), darkened by kEdgeShade.
-static UIColor *edgeColor(CGImageRef image, CGFloat share, BOOL bottom) {
-    size_t width = CGImageGetWidth(image), height = CGImageGetHeight(image);
-    if (!width || !height) return UIColor.blackColor;
-    size_t rows = MIN(height, MAX((size_t)1, (size_t)round(height * share)));
-    CGImageRef strip = CGImageCreateWithImageInRect(image, CGRectMake(0, bottom ? height - rows : 0, width, rows));
-    if (!strip) return UIColor.blackColor;
-    uint8_t pixel[4] = {0, 0, 0, 255};
-    CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef context = CGBitmapContextCreate(pixel, 1, 1, 8, 4, space, (CGBitmapInfo)kCGImageAlphaNoneSkipLast);
-    CGColorSpaceRelease(space);
-    if (context) {
-        CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
-        CGContextDrawImage(context, CGRectMake(0, 0, 1, 1), strip);
-        CGContextRelease(context);
-    }
-    CGImageRelease(strip);
-    return [UIColor colorWithRed:pixel[0] / 255.0 * kEdgeShade green:pixel[1] / 255.0 * kEdgeShade
-                            blue:pixel[2] / 255.0 * kEdgeShade alpha:1];
 }
 
 // The 75th percentile of the luminances: the bright end the text has to stand out against, past a few
@@ -167,12 +147,12 @@ static CGFloat brightEnd(NSData *luminances) {
     // and above it, as the lock screen draws the cover. Each is a still with a video over it, like _still.
     CALayer *_foot, *_head;
     AVPlayerLayer *_footClip, *_headClip;
+    NSArray *_footBlur;   // the foot's blur, which a Canvas's foot does without
+    CGFloat _footRows;    // the share of the poster's height a Canvas's foot draws, from its bottom
     CALayer *_dim;   // black over the clip and its foot, as dark as the clip is bright
     NSMutableData *_luminances;   // of the frames measured so far
     BOOL _lyricsUp;
     UIVisualEffectView *_seamBlur, *_headBlur, *_lyricsBlur;
-    UIView *_tints;   // over the blurs, so what they tint is covered too; one view, so it fades with the clip
-    CAGradientLayer *_headTint, *_footTint;
     CGFloat _aspect;
     BOOL _timing;   // the give-up's count is running
 }
@@ -204,7 +184,8 @@ static UIBlurEffect *blurEffect(void) {
     _foot = [CALayer layer];
     _foot.contentsGravity = kCAGravityResizeAspectFill;
     _foot.masksToBounds = YES;
-    _foot.filters = mirrorBlurFilters();
+    _footBlur = mirrorBlurFilters();
+    _foot.filters = _footBlur;
     _footClip = [AVPlayerLayer layer];
     _footClip.videoGravity = AVLayerVideoGravityResizeAspectFill;
     [_foot addSublayer:_footClip];
@@ -254,14 +235,6 @@ static UIBlurEffect *blurEffect(void) {
     [headMask.layer addSublayer:_headMask];
     _headBlur.maskView = headMask;
     [self addSubview:_headBlur];
-    _tints = [[UIView alloc] initWithFrame:frame];
-    _tints.userInteractionEnabled = NO;
-    _tints.alpha = 0;
-    _headTint = [CAGradientLayer layer];
-    _footTint = [CAGradientLayer layer];
-    [_tints.layer addSublayer:_headTint];
-    [_tints.layer addSublayer:_footTint];
-    [self addSubview:_tints];
     _lyricsBlur = [[UIVisualEffectView alloc] initWithEffect:nil];
     _lyricsBlur.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     [self addSubview:_lyricsBlur];
@@ -301,14 +274,16 @@ static UIBlurEffect *blurEffect(void) {
     if (fills) height = MAX(height, screen);
     // A clip that does not fill the window starts a little way down; the head fills what that leaves above.
     CGFloat top = fills ? 0 : round(screen * kCoverDrop);
-    CGFloat seam = top + round(height * kFootFrom), blurFrom = MAX(0, MIN(seam - kBlurLead, round(screen * kBlurByControls)));
+    CGFloat seam = top + round(height * kFootFrom);
+    // A Canvas's blur starts as it did, at the seam or above the controls; a cover's, kBlurLead before the seam.
+    CGFloat blurFrom = fills ? MIN(seam, round(screen * kBlurByControls))
+                             : MAX(0, MIN(seam - kBlurLead, round(screen * kBlurByControls)));
     _picture.frame = bounds;
     _seamBlur.frame = bounds;
     _seamBlur.maskView.frame = bounds;
     _headBlur.frame = bounds;
     _headBlur.maskView.frame = bounds;
-    _headBlur.hidden = top <= 0;   // a clip that fills the window has no room above it
-    _tints.frame = bounds;
+    _headBlur.hidden = fills || top <= 0;   // a clip that fills the window has no room above it
     _lyricsBlur.frame = bounds;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -320,40 +295,53 @@ static UIBlurEffect *blurEffect(void) {
     // The foot is the clip flipped about its seam: below the seam it shows the rows above it, nearest first. The
     // head is the clip flipped about where its fade-in ends, so what shows through the fade-in, and above the
     // clip, is the picture too. Each is drawn as the clip is (same size and fill), so they stay in step with it.
-    CGRect size = CGRectMake(0, 0, width, height);
-    CGFloat seamRow = round(height * kFootFrom);
-    _foot.bounds = size;
-    _foot.position = CGPointMake(width / 2, top + 2 * seamRow - height / 2);
-    _foot.transform = CATransform3DMakeScale(1, -1, 1);
-    _footClip.frame = size;
-    _head.bounds = size;
-    _head.position = CGPointMake(width / 2, top + 2 * kHeadRamp - height / 2);
-    _head.transform = CATransform3DMakeScale(1, -1, 1);
-    _headClip.frame = size;
-    _head.hidden = top <= 0;
+    if (fills) {
+        // A Canvas's foot as it was: its last rows, stretched from the seam to the bottom of the window, taking the
+        // same middle the clip shows where it is drawn taller than its shape and cut at its sides. No head.
+        CGFloat shown = height > 0 ? MIN(1, width * _aspect / height) : 1;
+        _foot.transform = CATransform3DIdentity;
+        _foot.filters = nil;
+        _foot.masksToBounds = NO;
+        _foot.contentsGravity = kCAGravityResize;
+        _foot.frame = CGRectMake(0, seam, width, MAX(0, total - seam));
+        _foot.contentsRect = CGRectMake((1 - shown) / 2, 1 - _footRows, shown, _footRows);
+        _footClip.hidden = YES;
+        _head.hidden = YES;
+    } else {
+        CGRect size = CGRectMake(0, 0, width, height);
+        CGFloat seamRow = round(height * kFootFrom);
+        _foot.filters = _footBlur;
+        _foot.masksToBounds = YES;
+        _foot.contentsGravity = kCAGravityResizeAspectFill;
+        _foot.contentsRect = CGRectMake(0, 0, 1, 1);
+        _foot.bounds = size;
+        _foot.position = CGPointMake(width / 2, top + 2 * seamRow - height / 2);
+        _foot.transform = CATransform3DMakeScale(1, -1, 1);
+        _footClip.hidden = NO;
+        _footClip.frame = size;
+        _head.bounds = size;
+        _head.position = CGPointMake(width / 2, top + 2 * kHeadRamp - height / 2);
+        _head.transform = CATransform3DMakeScale(1, -1, 1);
+        _headClip.frame = size;
+        _head.hidden = top <= 0;
+    }
     _dim.frame = bounds;
     _seamMask.frame = bounds;
     _headMask.frame = bounds;
     _headMask.locations = @[@0, @(MIN(1, top / total)), @(MIN(1, (top + 2 * kHeadRamp) / total))];
-    // The top's tint is whole at the top of the window and gone a little below the cover's top edge; the bottom's
-    // comes in from the seam (from where the blur is whole for a clip that fills the window).
-    _headTint.frame = CGRectMake(0, 0, width, top + kHeadRamp);
-    _headTint.hidden = top <= 0;
-    CGFloat tintFrom = fills ? blurFrom : seam;
-    _footTint.frame = bounds;
-    _footTint.locations = @[@(MIN(1, tintFrom / total)), @(MIN(1, (tintFrom + kFootTintReach) / total))];
     _seamMask.locations = @[@(MIN(1, blurFrom / total)), @(MIN(1, (blurFrom + kBlurRamp) / total))];
+    // A Canvas shows the material whole, as it did; a cover less of it.
+    _seamMask.colors = @[(id)UIColor.clearColor.CGColor,
+                         (id)[UIColor.blackColor colorWithAlphaComponent:fills ? 1 : kSeamBlurMost].CGColor];
     [CATransaction commit];
 }
 
 - (void)playFile:(NSURL *)file poster:(UIImage *)poster {
     _aspect = poster.size.height / poster.size.width;
+    _footRows = MAX(kFootRows, 1 / MAX(1, poster.size.height * poster.scale));
     // The foot and the head have the poster under their video too, as _still has, until the video draws a frame.
     _still.contents = (__bridge id)poster.CGImage;
     _foot.contents = (__bridge id)poster.CGImage;
-    UIColor *headColor = edgeColor(poster.CGImage, kEdgeRows, NO), *footColor = edgeColor(poster.CGImage, kEdgeRows, YES);
-    _headTint.colors = @[(id)[headColor colorWithAlphaComponent:kEdgeTint].CGColor, (id)[headColor colorWithAlphaComponent:0].CGColor];
-    _footTint.colors = @[(id)[footColor colorWithAlphaComponent:0].CGColor, (id)[footColor colorWithAlphaComponent:kEdgeTint].CGColor];
     _head.contents = (__bridge id)poster.CGImage;
     [self setNeedsLayout];
     _player = [AVQueuePlayer new];
@@ -398,17 +386,19 @@ static UIBlurEffect *blurEffect(void) {
 }
 
 - (void)updateDim {
-    CGFloat dim = SGRPlayerClipDim(brightEnd(_luminances), UIAccessibilityDarkerSystemColorsEnabled(), _lyricsUp);
+    // An Apple Music cover (not a Canvas) is not dimmed, but for what the lyrics add; a Canvas is dimmed by how
+    // bright it is.
+    BOOL appleCover = _aspect > 0 && _aspect <= kCanvasAspect;
+    CGFloat dim = appleCover ? (_lyricsUp ? kDimLyrics : 0)
+                             : SGRPlayerClipDim(brightEnd(_luminances), UIAccessibilityDarkerSystemColorsEnabled(), _lyricsUp);
     _dim.opacity = (float)dim;
 }
 
 // `done` runs once the clip is opaque, unless something cut the fade in short.
 - (void)appear:(BOOL)animated then:(void (^)(void))done {
     _picture.alpha = 0;
-    _tints.alpha = 0;
     void (^apply)(void) = ^{
         self->_picture.alpha = 1;
-        self->_tints.alpha = 1;
         self->_seamBlur.effect = blurEffect();
         self->_headBlur.effect = blurEffect();
     };
@@ -426,7 +416,6 @@ static UIBlurEffect *blurEffect(void) {
 - (void)disappear:(void (^)(void))done {
     SGRAnimate(SGRMotionFade, ^{
         self->_picture.alpha = 0;
-        self->_tints.alpha = 0;
         self->_seamBlur.effect = nil;
         self->_headBlur.effect = nil;
         self->_lyricsBlur.effect = nil;
