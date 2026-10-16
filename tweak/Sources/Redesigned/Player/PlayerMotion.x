@@ -57,6 +57,8 @@ static const CGFloat kBlurByControls = 0.6, kBlurRamp = 96;
 // A cover that ends above that starts its blur this far before its seam, so it is already soft where its mirror
 // begins. At the top the cover fades in over kHeadRamp points, and the blur there fades out over twice that.
 static const CGFloat kBlurLead = 110, kHeadRamp = 48;
+// How hard the mirrored head and foot are blurred (a Gaussian's radius): enough that nothing in them is made out.
+static const CGFloat kMirrorBlur = 50;
 // How much of the blur's material shows, at the top and the bottom, at most: less of it is less gray over the picture.
 static const CGFloat kSeamBlurMost = 0.9;
 // Seconds a clip may be on screen in front without drawing a frame before it is given up.
@@ -122,6 +124,12 @@ static CGFloat brightEnd(NSData *luminances) {
 - (void)setBlurred:(BOOL)blurred animated:(BOOL)animated;
 @end
 
+// QuartzCore's own blur filter, found by name: the Gaussian blur UIKit's blurs are made of. A visual effect view only
+// blurs what is behind it, and not as hard as the mirrored copies need; a layer takes this one itself.
+@protocol SGRCAFilter <NSObject>
++ (id)filterWithType:(NSString *)type;
+@end
+
 @implementation SGRPlayerMotionView {
     AVQueuePlayer *_player;
     AVPlayerLooper *_looper;
@@ -141,6 +149,18 @@ static CGFloat brightEnd(NSData *luminances) {
     BOOL _timing;   // the give-up's count is running
 }
 
+// The filters of a mirrored layer: a hard blur, with its edges kept at the color they have rather than faded out.
+static NSArray *mirrorBlurFilters(void) {
+    Class<SGRCAFilter> filterClass = NSClassFromString(@"CAFilter");
+    id filter = [filterClass filterWithType:@"gaussianBlur"];
+    if (!filter) return nil;
+    @try {
+        [filter setValue:@(kMirrorBlur) forKey:@"inputRadius"];
+        [filter setValue:@YES forKey:@"inputNormalizeEdges"];
+    } @catch (...) {}
+    return @[filter];
+}
+
 // What fades is the effect views' effect, never their alpha or an ancestor's: UIKit draws a blur under a
 // fading alpha or a mask wrongly or not at all.
 static UIBlurEffect *blurEffect(void) {
@@ -156,6 +176,7 @@ static UIBlurEffect *blurEffect(void) {
     _foot = [CALayer layer];
     _foot.contentsGravity = kCAGravityResizeAspectFill;
     _foot.masksToBounds = YES;
+    _foot.filters = mirrorBlurFilters();
     _footClip = [AVPlayerLayer layer];
     _footClip.videoGravity = AVLayerVideoGravityResizeAspectFill;
     [_foot addSublayer:_footClip];
@@ -163,6 +184,7 @@ static UIBlurEffect *blurEffect(void) {
     _head = [CALayer layer];
     _head.contentsGravity = kCAGravityResizeAspectFill;
     _head.masksToBounds = YES;
+    _head.filters = mirrorBlurFilters();
     _headClip = [AVPlayerLayer layer];
     _headClip.videoGravity = AVLayerVideoGravityResizeAspectFill;
     [_head addSublayer:_headClip];
